@@ -129,17 +129,26 @@ def combine_vectorstores(pdf_paths: List[str]) -> Tuple[Optional[FAISS], Optiona
 
 
 def split_by_subchapter(text: str) -> Dict[str, str]:
-    """텍스트에서 '숫자.숫자' 형태(예: 2.1)를 기준으로 분리합니다."""
-    pattern = r"(?=(\d+\.\d+))"
+    """텍스트에서 '숫자.숫자' 또는 '숫자.숫자.숫자' 형태를 기준으로 분리합니다."""
+    # (숫자.숫자) 또는 (숫자.숫자.숫자) 형태를 인식하도록 정규표현식 확장
+    pattern = r"(?=(\d+\.\d+(\.\d+)?))"
     splits = re.split(pattern, text)
     chapters = {}
     current_chapter = None
+    
+    # re.split()은 그룹을 포함하므로, 그룹도 결과에 포함됨.
+    # 따라서, 캡처된 그룹을 건너뛰고 텍스트 세그먼트를 처리해야 함.
     for seg in splits:
-        if re.match(r"\d+\.\d+", seg.strip()):
+        if seg is None or not seg.strip():
+             continue
+             
+        # 숫자로 시작하고 점을 포함하는 챕터 키 매칭 (예: 4.1, 4.1.1)
+        if re.match(r"^\d+\.\d+(\.\d+)?$", seg.strip()):
             current_chapter = seg.strip()
             chapters[current_chapter] = ""
         elif current_chapter:
             chapters[current_chapter] += seg.strip() + "\n"
+            
     return chapters
 
 # ===============================================
@@ -164,6 +173,33 @@ summary_prompt = PromptTemplate(
 2. ...
 3. ...
 ---
+"""
+)
+
+bulk_summary_prompt = PromptTemplate(
+    input_variables=["content", "chapters_list"],
+    template="""
+당신은 교재의 핵심 내용을 단원별로 요약하는 전문가입니다. 
+다음 내용을 기반으로 아래 지정된 소단원 리스트에 대해 각각 핵심 요약(3~5개 항목)을 작성하세요.
+
+- 요약은 간결하고 명료해야 하며, 주요 개념과 정의를 포함해야 합니다.
+- 응답은 **반드시** 다음의 **JSON 배열** 형식으로만 구성되어야 합니다. 다른 설명이나 텍스트를 절대 포함하지 마세요.
+- chapters_list의 단원 번호와 정확히 일치시켜 JSON의 "chapter" 필드에 값을 넣으세요.
+
+내용:
+{content}
+
+---
+요약할 소단원 리스트: {chapters_list}
+
+출력 형식:
+[
+  {{
+    "chapter": "단원 번호 (예: 4.1)",
+    "summaryText": "--- \n[요약]\n1. ...\n2. ...\n3. ...\n---" 
+  }},
+  // ... 모든 소단원에 대해 반복
+]
 """
 )
 
@@ -238,40 +274,73 @@ def summarize_subchapters(content: str, request_chapter: Optional[str] = None) -
 
     summaries = []
     
-    # 1. 특정 단원 요청 (예: '4.1장' 또는 '4장')
-    if request_chapter:
-        req = request_chapter.strip().lower()
-        matched_keys = []
+    # 1. 특정 단원 요청 처리 로직 (Case 1)
+    if request_chapter and request_chapter.strip(): # 👈 None 또는 빈 문자열 검사 추가
+        logger.info(f"➡️ 특정 단원 요청 감지: {request_chapter}")
         
-        # 숫자.숫자 패턴 우선
-        m_dot = re.search(r"(\d+\.\d+)", req)
-        if m_dot:
-            key = m_dot.group(1)
-            if key in chapters:
-                matched_keys.append(key)
+        match = re.search(r"(\d+\.\d+)", request_chapter)
+        if not match:
+            logger.warning(f"❌ 요청에서 유효한 단원 번호(예: 4.2)를 찾을 수 없습니다: {request_chapter}")
+            # 유효한 단원 번호가 없어도 전체 요약을 시키지 않고 오류 처리
+            return [], f"❌ 요청에서 유효한 단원 번호(예: 4.2)를 찾을 수 없습니다: {request_chapter}"
         
-        # 숫자 패턴 (상위 장)
-        m_major = re.search(r"(\d+)", req)
-        if not matched_keys and m_major:
-            major = m_major.group(1) 
-            matched_keys = sorted([k for k in chapters.keys() if k.startswith(f"{major}.")])
-            
+        target_chapter = match.group(1)
+        matched_keys = sorted([k for k in chapters.keys() if k.startswith(target_chapter)])
+        
         if not matched_keys:
-            return [], f"❌ 요청한 단원 '{request_chapter}' 에 해당하는 내용을 찾을 수 없습니다."
+            return [], f"❌ 컨텐츠에서 요청하신 단원({target_chapter})을 찾을 수 없습니다. 가능한 단원: {', '.join(sorted(chapters.keys()))[:100]}..."
         
-        # 매칭된 단원들만 결합 및 요약
-        combined = "\n\n".join([chapters[k] for k in matched_keys])
-        summary = summarize_pdf_content(combined)
+        combined = "\n\n".join([chapters[k] for k in matched_keys if k in chapters])
+        summary = summarize_pdf_content(combined) 
+        
         summaries.append({"chapter": ", ".join(matched_keys), "summaryText": summary})
         
-        return summaries, "✅ 요청된 단원 요약 완료"
-
-    # 2. 전체 단원 요약 요청 (request_chapter가 None일 때)
-    for key, text in chapters.items():
-        summary = summarize_pdf_content(text)
-        summaries.append({"chapter": key, "summaryText": summary})
+        logger.info(f"✅ 단원 요청 처리 완료: {target_chapter}")
+        return summaries, f"✅ 요청된 단원 ({target_chapter}) 요약 완료"
         
-    return summaries, "✅ 단원별 전체 요약 완료"
+    # 2. 전체 단원 요약 요청 (Case 2: request_chapter가 None이거나 빈 문자열인 경우)
+    logger.info("➡️ 전체 단원 요약 요청으로 전환됩니다 (request_chapter 없음 또는 유효하지 않음).")
+    
+    all_chapters_keys = sorted(chapters.keys())
+    
+    bulk_prompt = bulk_summary_prompt.format(
+        content=content[:10000], # 최대 10000자 사용
+        chapters_list=all_chapters_keys
+    )
+    
+    try:
+        result = llm.invoke(bulk_prompt)
+        
+        raw_json_text = result.content.strip()
+        # LLM이 JSON 응답에 마크다운을 붙이는 경우 제거
+        if raw_json_text.startswith("```json"):
+            raw_json_text = raw_json_text[7:]
+        if raw_json_text.endswith("```"):
+            raw_json_text = raw_json_text[:-3]
+
+        # 💡 핵심 개선: JSONDecodeError 방지용 제어 문자 제거
+        # \x00-\x08 (NULL, backspace, etc.) \x0b, \x0c, \x0e-\x1f (vertical tab, form feed, etc.) \x7f-\x9f (DEL, C1 control codes)
+        # \n, \r, \t는 JSON에서 허용되거나 \n로 이스케이프되므로 제외합니다.
+        cleaned_json_text = re.sub(r'[\x00-\x08\x0b\x0c\x0e-\x1f\x7f-\x9f]', '', raw_json_text) 
+
+        summaries_list = json.loads(cleaned_json_text) # 👈 정제된 텍스트 사용
+        
+        # 결과 필터링 및 형식 확인
+        for item in summaries_list:
+            if 'chapter' in item and 'summaryText' in item:
+                summaries.append({"chapter": item['chapter'], "summaryText": item['summaryText']})
+        
+        if not summaries:
+            return [], "❌ LLM이 유효한 JSON 형식의 요약 목록을 반환하지 못했습니다."
+
+    except json.JSONDecodeError as e:
+        logger.error(f"❌ LLM 응답 파싱 실패 (JSONDecodeError): {e} \n 원본 응답 시작: {raw_json_text[:100]}...")
+        return [], "❌ LLM이 요청된 JSON 형식으로 응답하지 못했습니다. 응답 내용을 확인하세요."
+    except Exception as e:
+        logger.error(f"❌ 전체 요약 처리 중 예상치 못한 오류 발생: {e}")
+        return [], f"❌ 전체 요약 처리 중 오류 발생: {e}"
+        
+    return summaries, "✅ 단원별 일괄 요약 완료 (LLM 1회 호출)"
 
 
 # ===============================================
@@ -326,17 +395,21 @@ async def summarize_full(request: PdfPathsRequest):
     return {"summaryText": result.content.strip()}
 
 @app.post("/summarize/chapter")
-async def summarize_chapter(request: ChapterRequest):
-    _, content = combine_vectorstores(request.pdf_paths)
+async def summarize_chapter(request: ChapterRequest): # 👈 ChapterRequest 모델 그대로 사용
+    """단원별 요약 (전체 또는 특정 단원 요청)."""
+    
+    _, content = combine_vectorstores(request.pdf_paths) 
     
     if not content:
         raise HTTPException(status_code=400, detail="PDF 내용을 로드하지 못했습니다. 경로를 확인하세요.")
     
+    # request.chapter_request는 "4.2장만 요약해줘" 같은 요청 문자열이거나 None입니다.
     summaries, message = summarize_subchapters(content, request_chapter=request.chapter_request)
     
     if not summaries:
-         raise HTTPException(status_code=404, detail=message)
-         
+        # LLM 응답 실패나 PDF 내용 로드 실패 시 404/400 대신 여기서 404 반환
+        raise HTTPException(status_code=404, detail=message)
+        
     return {"message": message, "summaries": summaries}
 
 # -----------------------------------------------
