@@ -9,7 +9,7 @@ from dotenv import load_dotenv
 from langchain_openai import ChatOpenAI, OpenAIEmbeddings
 from langchain_community.document_loaders import PyPDFLoader
 from langchain.prompts import PromptTemplate
-from langchain_community.tools.tavily_search import TavilySearchResults
+from langchain_tavily import TavilySearch
 from langchain_community.vectorstores import FAISS
 from pydantic import BaseModel, Field
 import logging
@@ -58,7 +58,7 @@ llm = ChatOpenAI(model="gpt-4o-mini", temperature=0.2, api_key=OPENAI_API_KEY)
 embeddings = OpenAIEmbeddings(api_key=OPENAI_API_KEY)
 
 # Tavily 도구 초기화 (API Key가 없으면 None)
-tavily_tool = TavilySearchResults(api_key=TAVILY_API_KEY, max_results=3) if TAVILY_API_KEY else None
+tavily_tool = TavilySearch(api_key=TAVILY_API_KEY, max_results=3) if TAVILY_API_KEY else None
 
 app = FastAPI(title="PDF 학습 도우미 API")
 
