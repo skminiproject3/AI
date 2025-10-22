@@ -285,15 +285,36 @@ async def health_check():
 @app.post("/upload_pdfs/")
 async def upload_pdfs(files: List[UploadFile] = File(...)):
     saved_files = []
+    created_vectors = []
+    
     for file in files:
         save_path = os.path.join(UPLOAD_DIR, file.filename)
+        
+        # 1. 파일 저장
         try:
             with open(save_path, "wb") as f:
                 f.write(await file.read())
             saved_files.append(save_path)
+            
+            # 2. 파일 저장 직후 벡터스토어 생성 및 저장 시도 (추가된 부분)
+            logger.info(f"✨ 업로드 직후 벡터스토어 생성을 시도합니다: {save_path}")
+            vs = get_or_create_vectorstore(save_path)
+            
+            if vs:
+                created_vectors.append(save_path)
+            else:
+                logger.error(f"❌ 벡터스토어 생성 실패: {save_path}")
+
         except Exception as e:
-            return {"error": str(e)}
-    return {"saved_files": saved_files}
+            logger.error(f"❌ 파일 업로드 또는 벡터 생성 중 오류 발생: {e}")
+            # 이전에 저장된 파일이 있다면 정리할 수도 있지만, 여기서는 간단히 오류 응답
+            return JSONResponse(status_code=500, content={"error": f"파일 처리 중 오류 발생: {str(e)}"})
+            
+    return {
+        "saved_files": saved_files,
+        "vector_status": f"{len(created_vectors)}개의 파일에 대한 벡터스토어 생성 완료.",
+        "created_vectors_for": created_vectors
+    }
 
 @app.post("/summarize/full")
 async def summarize_full(request: PdfPathsRequest):
