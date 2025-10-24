@@ -99,23 +99,6 @@ def get_or_create_vectorstore(pdf_path: str) -> Optional[FAISS]:
         logger.error(f"❌ 벡터 생성 실패 ({pdf_path}): {e}")
         return None
 
-def combine_vectorstores(pdf_paths: List[str]) -> Tuple[Optional[FAISS], Optional[str]]:
-    vectorstores = []
-    combined_content = ""
-    for pdf_path in pdf_paths:
-        if not os.path.exists(pdf_path):
-            continue
-        vs = get_or_create_vectorstore(pdf_path)
-        if vs:
-            vectorstores.append(vs)
-            combined_content += extract_text_from_pdf(pdf_path) + "\n\n--- PDF 분리 ---\n\n"
-    if not vectorstores:
-        return None, None
-    main_vs = vectorstores[0]
-    for i in range(1, len(vectorstores)):
-        main_vs.merge_from(vectorstores[i])
-    return main_vs, combined_content.strip()
-
 def split_by_subchapter(text: str) -> Dict[str,str]:
     """텍스트에서 단원별로 분리 (숫자.숫자 또는 숫자.숫자.숫자)"""
     pattern = r"^(\d+\.\d+(\.\d+)?)\s*(.*)$"  # 숫자.숫자 + optional 단원 제목
@@ -133,41 +116,7 @@ def split_by_subchapter(text: str) -> Dict[str,str]:
         elif current_chapter:
             chapters[current_chapter] += line + "\n"
     return chapters
-# PDF 경로를 boot에서 전달받는  함수 (Boot에서 DB 조회 후 전달)
-# -----------------------
-# PDF 경로 조회 함수
-# -----------------------
-def get_pdf_paths_for_content(content_id: int):
-    """
-    content_id 기준으로 MariaDB에서 file_path를 조회
-    반환: 파일 경로 리스트
-    """
-    connection = None
-    paths = []
 
-    try:
-        connection = pymysql.connect(
-            host=DB_HOST,
-            port=DB_PORT,
-            user=DB_USER,
-            password=DB_PASSWORD,
-            database=DB_DATABASE,
-            charset='utf8mb4',
-            cursorclass=pymysql.cursors.DictCursor
-        )
-
-        with connection.cursor() as cursor:
-            sql = "SELECT file_path FROM contents WHERE id=%s"
-            cursor.execute(sql, (content_id,))
-            result = cursor.fetchall()
-            paths = [row['file_path'] for row in result if row['file_path']]
-    except Exception as e:
-        print(f"❌ PDF 경로 조회 실패: {e}")
-    finally:
-        if connection:
-            connection.close()
-
-    return 
 def get_vector_paths_for_content(content_id: int) -> List[str]:
     """
     content_id 기준으로 MariaDB에서 vector_path를 조회
@@ -239,106 +188,37 @@ def query_web(question: str):
     except Exception as e:
         logger.exception(f"웹 검색 처리 중 오류: {e}")
         return None
+def get_pdf_paths_for_content(content_id: int) -> List[str]:
+    """
+    content_id 기준으로 MariaDB에서 PDF 경로(file_path) 조회
+    반환: PDF 경로 리스트
+    """
+    connection = None
+    paths = []
 
-def query_pdf_rag(vectorstore, question: str) -> str:
-    """
-    PDF RAG 기반 답변
-    """
     try:
-        retriever = vectorstore.as_retriever(search_kwargs={"k": 4})
-        rag_chain = RetrievalQA.from_chain_type(llm=llm, retriever=retriever, return_source_documents=True)
-        pdf_response = rag_chain.invoke({"query": question})
+        connection = pymysql.connect(
+            host=DB_HOST,
+            port=DB_PORT,
+            user=DB_USER,
+            password=DB_PASSWORD,
+            database=DB_DATABASE,
+            charset='utf8mb4',
+            cursorclass=pymysql.cursors.DictCursor
+        )
 
-        # PDF 결과 안전하게 추출
-        if isinstance(pdf_response, dict):
-            result_text = str(pdf_response.get("result") or pdf_response.get("output_text") or "")
-            sources = pdf_response.get("source_documents") or []
-        else:
-            result_text = str(pdf_response)
-            sources = []
-
-        if sources and len(result_text.strip()) > 10:
-            return result_text.strip()
-        else:
-            return None
+        with connection.cursor() as cursor:
+            sql = "SELECT file_path FROM contents WHERE id=%s"
+            cursor.execute(sql, (content_id,))
+            result = cursor.fetchall()
+            paths = [row['file_path'] for row in result if row['file_path']]
     except Exception as e:
-        logger.exception(f"PDF RAG 처리 중 오류: {e}")
-        return None
-    
-async def ask_question_logic(content_id: int, question: str, force_web: bool) -> Dict:
-    """
-    content_id: Boot DB contents.id
-    question: 질문 텍스트
-    force_web: True이면 PDF 무시하고 웹 검색 강제
-    반환: dict {"source":"PDF"/"WEB"/"NONE", "answer":..., "reference":..., "message":...}
-    """
+        logger.error(f"❌ PDF 경로 조회 실패: {e}")
+    finally:
+        if connection:
+            connection.close()
 
-    # 1) PDF 경로 조회
-    pdf_paths = get_pdf_paths_for_content(content_id)
-    vectorstore, combined_text = (None, None)
-    if pdf_paths:
-        vectorstore, combined_text = combine_vectorstores(pdf_paths)
-
-    # 2) PDF 기반 RAG
-    if vectorstore and not force_web:
-        try:
-            retriever = vectorstore.as_retriever(search_kwargs={"k": 4})
-            rag_chain = RetrievalQA.from_chain_type(llm=llm, retriever=retriever, return_source_documents=True)
-            pdf_resp = rag_chain.invoke({"query": question})
-
-            # PDF 응답 파싱
-            answer_text = ""
-            sources = []
-            if isinstance(pdf_resp, dict):
-                answer_text = str(pdf_resp.get("result") or pdf_resp.get("output_text") or "")
-                sources = pdf_resp.get("source_documents") or []
-            else:
-                answer_text = str(pdf_resp)
-
-            if sources and len(answer_text.strip()) > 10:
-                refs = []
-                for s in sources[:3]:
-                    meta = getattr(s, "metadata", {}) or (s.get("metadata") if isinstance(s, dict) else {})
-                    snippet = getattr(s, "page_content", "") or s.get("page_content", "")
-                    refs.append({"metadata": meta, "snippet": snippet[:300]})
-                return {"source": "PDF", "answer": answer_text.strip(), "pdf_references": refs, "message": "PDF 문서에서 답변을 찾았습니다."}
-        except Exception as e:
-            logger.exception(f"PDF RAG 처리 실패: {e}")
-
-    # 3) 웹 폴백 (Tavily)
-    if tavily_tool:
-        try:
-            query_clean = re.sub(r"(웹에서|웹으로|인터넷|검색|해줘|알려줘)", "", question, flags=re.IGNORECASE).strip()
-            query_clean = query_clean or question
-            web_resp = tavily_tool.invoke({"query": query_clean})
-            results = web_resp.get("results", []) if isinstance(web_resp, dict) else web_resp
-
-            if results:
-                best = sorted(results, key=lambda x: x.get("score",0), reverse=True)[0]
-                title = best.get("title") or best.get("url") or "출처 없음"
-                url = best.get("url", "")
-                content = best.get("content") or best.get("snippet") or str(best)[:400]
-
-                if len(content) > 30:
-                    prompt = f"""
-아래 정보를 바탕으로 질문에 대한 간결하고 정확한 답변 작성 (한국어)
-출처 제목: {title}
-출처 URL: {url}
-출처 내용: {content}
-질문: {question}
-- 답변 3~6문장
-- reference에 URL 포함
-"""
-                    summary = llm.invoke(prompt).content.strip()
-                else:
-                    summary = content
-
-                return {"source": "WEB", "answer": summary, "reference": {"title": title, "url": url}, "message": "웹 검색 결과 기반 답변"}
-        except Exception as e:
-            logger.exception(f"웹 검색 실패: {e}")
-
-    # 4) 실패
-    return {"source": "NONE", "answer": "PDF 및 웹에서 관련 정보 없음", "message": "검색 실패"}
+    return paths
 # -----------------------
 # 요약 프롬프트
 # -----------------------
@@ -605,23 +485,42 @@ async def quiz_generate(content_id: int, request: dict):
         if not num_questions or not difficulty:
             raise HTTPException(status_code=400, detail="num_questions, difficulty 필수")
 
-        # 1️⃣ DB에서 vector_path 조회
-        vector_paths = get_vector_paths_for_content(content_id)
-        if not vector_paths:
-            raise HTTPException(status_code=404, detail="벡터스토어 경로 없음")
+        # # 1️⃣ DB에서 vector_path 조회
+        # vector_paths = get_vector_paths_for_content(content_id)
+        # if not vector_paths:
+        #     raise HTTPException(status_code=404, detail="벡터스토어 경로 없음")
 
-        # 2️⃣ vector_path 기반 FAISS 로드
+        # 변경: PDF 경로(file_path) 조회
+        pdf_paths = get_pdf_paths_for_content(content_id)
+        if not pdf_paths:
+            raise HTTPException(status_code=404, detail="PDF 경로 없음")
+        
+        # # 2️⃣ vector_path 기반 FAISS 로드
+        # vectorstores = []
+        # for vp in vector_paths:
+        #     if os.path.exists(vp):
+        #         try:
+        #             vs = FAISS.load_local(vp, embeddings, allow_dangerous_deserialization=True)
+        #             vectorstores.append(vs)
+        #         except Exception as e:
+        #             logger.error(f"벡터스토어 로드 실패 ({vp}): {e}")
+
+        # if not vectorstores:
+        #     raise HTTPException(status_code=500, detail="벡터스토어 로드 실패")
+
         vectorstores = []
-        for vp in vector_paths:
-            if os.path.exists(vp):
+        for pdf_path in pdf_paths:
+            if os.path.exists(pdf_path):
                 try:
-                    vs = FAISS.load_local(vp, embeddings, allow_dangerous_deserialization=True)
-                    vectorstores.append(vs)
+                    vs = get_or_create_vectorstore(pdf_path)  # PDF 기반 FAISS 생성
+                    if vs:
+                        vectorstores.append(vs)
                 except Exception as e:
-                    logger.error(f"벡터스토어 로드 실패 ({vp}): {e}")
+                    logger.error(f"PDF 기반 벡터스토어 생성 실패 ({pdf_path}): {e}")
 
         if not vectorstores:
-            raise HTTPException(status_code=500, detail="벡터스토어 로드 실패")
+            raise HTTPException(status_code=500, detail="벡터스토어 생성 실패")
+        
         # 3️⃣ 여러 벡터스토어가 있으면 합치기
         main_vs = vectorstores[0]
         for vs in vectorstores[1:]:
