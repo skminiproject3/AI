@@ -6,6 +6,7 @@ import logging
 from typing import List, Tuple, Optional, Dict
 from fastapi import FastAPI, UploadFile, File, HTTPException
 from fastapi.responses import JSONResponse
+from importlib_metadata import metadata
 from pydantic import BaseModel, Field
 from dotenv import load_dotenv
 from langchain_openai import ChatOpenAI, OpenAIEmbeddings
@@ -79,25 +80,88 @@ def extract_text_from_pdf(pdf_path: str) -> str:
     except Exception as e:
         logger.error(f"PDF 추출 실패 ({pdf_path}): {e}")
         return ""
+def recognize_chapters_with_llm(full_text: str) -> List[Dict]:
+    first_match = re.search(r"^(\d+)\s", full_text, re.MULTILINE)
+    chapters = []
+    if first_match:
+        chapters.append({"chapter": first_match.group(1), "title": ""})
+
+    try:
+        prompt = f"""
+아래는 PDF 텍스트입니다.
+텍스트에서 '장 번호'와 '장 제목'을 JSON 형태로 반환하세요.
+예: {{ "chapters": [{{"chapter": "1", "title": "암호 개론"}}] }}
+
+텍스트:
+{full_text[:5000]}
+"""
+        resp = llm.invoke(prompt)
+        json_text = re.sub(r"```json|```", "", resp.content.strip())
+        llm_chapters = json.loads(json_text).get("chapters", [])
+        chapters = llm_chapters if llm_chapters else chapters
+    except Exception as e:
+        logger.warning(f"LLM 챕터 인식 실패: {e}")
+    
+    return chapters
+
+def get_ordered_subchapters(metadata: dict) -> List[str]:
+    """PDF 등장 순서 그대로 단원 번호 반환"""
+    chapters = metadata.get("chapters", [])
+    return [ch["chapter"] for ch in chapters if "chapter" in ch]
 
 def get_or_create_vectorstore(pdf_path: str) -> Optional[FAISS]:
-    normalized_path = pdf_path.replace("\\","/")
+    # normalized_path = pdf_path.replace("\\","/")
+    # path_hash = hashlib.md5(normalized_path.encode()).hexdigest()
+    # vector_path = os.path.join(VECTOR_DIR, path_hash)
+    # if os.path.exists(vector_path):
+    #     return FAISS.load_local(vector_path, embeddings, allow_dangerous_deserialization=True)
+    # try:
+    #     loader = PyPDFLoader(pdf_path)
+    #     texts = [p.page_content for p in loader.load()]
+    #     if not texts:
+    #         return None
+    #     vs = FAISS.from_texts(texts, embeddings)
+    #     vs.save_local(vector_path)
+    #     logger.info(f"✅ 벡터스토어 생성 완료: {pdf_path}")
+    #     return vs
+    # except Exception as e:
+    #     logger.error(f"❌ 벡터 생성 실패 ({pdf_path}): {e}")
+    #     return None
+    normalized_path = pdf_path.replace("\\", "/")
     path_hash = hashlib.md5(normalized_path.encode()).hexdigest()
     vector_path = os.path.join(VECTOR_DIR, path_hash)
+    metadata_path = os.path.join(vector_path, "metadata.json")
+
     if os.path.exists(vector_path):
+        logger.info(f"📂 기존 벡터스토어 로드: {pdf_path}")
         return FAISS.load_local(vector_path, embeddings, allow_dangerous_deserialization=True)
+
     try:
         loader = PyPDFLoader(pdf_path)
-        texts = [p.page_content for p in loader.load()]
+        pages = loader.load()
+        texts = [p.page_content for p in pages]
         if not texts:
-            return None
+            raise ValueError("PDF에 텍스트가 없습니다")
+
+        full_text = "\n".join(texts)
+        chapters = recognize_chapters_with_llm(full_text)
+
+        # 벡터스토어 생성
         vs = FAISS.from_texts(texts, embeddings)
+        os.makedirs(vector_path, exist_ok=True)
         vs.save_local(vector_path)
-        logger.info(f"✅ 벡터스토어 생성 완료: {pdf_path}")
+
+        # 메타데이터 저장
+        with open(metadata_path, "w", encoding="utf-8") as f:
+            json.dump({"chapters": chapters}, f, ensure_ascii=False, indent=2)
+
+        logger.info(f"✅ 벡터스토어 + 챕터 메타데이터 생성 완료: {pdf_path}")
         return vs
+
     except Exception as e:
         logger.error(f"❌ 벡터 생성 실패 ({pdf_path}): {e}")
         return None
+
 
 def combine_vectorstores(pdf_paths: List[str]) -> Tuple[Optional[FAISS], Optional[str]]:
     vectorstores = []
@@ -472,86 +536,61 @@ async def summarize_full(content_id: int):
 # -----------------------
 @app.post("/api/contents/{content_id}/summaries")
 async def summarize_chapter(content_id: int, request: ChapterRequest):
-    try:
-        # 1️⃣ DB에서 vector_path 조회
-        vector_paths = get_vector_paths_for_content(content_id)
-        if not vector_paths:
-            raise HTTPException(status_code=404, detail="벡터스토어 경로가 없습니다")
+    vector_paths = get_vector_paths_for_content(content_id)
+    if not vector_paths:
+        raise HTTPException(status_code=404, detail="벡터스토어 경로 없음")
 
-        # 2️⃣ vector_path 기반 FAISS 로드 및 전체 텍스트 합치기
-        vectorstores = []
-        combined_content = ""
-        for vp in vector_paths:
-            if os.path.exists(vp):
-                try:
-                    vs = FAISS.load_local(vp, embeddings, allow_dangerous_deserialization=True)
-                    vectorstores.append(vs)
+    combined_text = ""
+    subchapters_ordered = []
 
-                    # FAISS에서 직접 텍스트 추출
-                    for doc in vs.docstore._dict.values():
-                        page_text = getattr(doc, "page_content", "") if hasattr(doc, "page_content") else str(doc)
-                        combined_content += page_text + "\n\n--- PDF 분리 ---\n\n"
+    for vp in vector_paths:
+        metadata_path = os.path.join(vp, "metadata.json")
+        vs = FAISS.load_local(vp, embeddings, allow_dangerous_deserialization=True)
+        for doc in vs.docstore._dict.values():
+            combined_text += getattr(doc, "page_content", "") + "\n"
+        if os.path.exists(metadata_path):
+            with open(metadata_path, "r", encoding="utf-8") as f:
+                metadata = json.load(f)
+                subchapters_ordered.extend(get_ordered_subchapters(metadata))
 
-                except Exception as e:
-                    logger.error(f"벡터스토어 로드 실패 ({vp}): {e}")
+    if not request.chapter_request:
+        raise HTTPException(status_code=400, detail="chapter_request 필요")
 
-        if not vectorstores or not combined_content.strip():
-            raise HTTPException(status_code=500, detail="벡터스토어 로드 또는 텍스트 확보 실패")
+    requested_idx = int(request.chapter_request) - 1
+    if requested_idx < 0 or requested_idx >= len(subchapters_ordered):
+        raise HTTPException(status_code=404, detail="요청 단원 없음")
 
-        # 3️⃣ 여러 벡터스토어가 있으면 합치기
-        main_vs = vectorstores[0]
-        for vs in vectorstores[1:]:
-            main_vs.merge_from(vs)
+    target_subchapter = subchapters_ordered[requested_idx]
 
-        # 4️⃣ 단원별로 분리
-        chapters = split_by_subchapter(combined_content)
-        summaries = []
+    # 단원 텍스트 추출
+    start_idx = combined_text.find(target_subchapter)
+    if requested_idx + 1 < len(subchapters_ordered):
+        next_chapter = subchapters_ordered[requested_idx + 1]
+        end_idx = combined_text.find(next_chapter, start_idx)
+        if end_idx == -1:
+            end_idx = len(combined_text)
+    else:
+        end_idx = len(combined_text)
+    chapter_text = combined_text[start_idx:end_idx]
 
-        if request.chapter_request:
-            # 특정 단원 요청 시
-            matched_keys = [k for k in chapters.keys() if k.startswith(request.chapter_request)]
-            if matched_keys:
-                combined = "\n\n".join([chapters[k] for k in matched_keys])
-                prompt = f"""
-다음 PDF 내용을 바탕으로 단원 요약을 작성하세요.
-- 최대 3문단 내외
-- 핵심 위주
-- 내용에 기반한 중요한 키워드 포함
+    # LLM 요약
+    prompt = f"""
+다음은 {target_subchapter}에 해당하는 교재 내용입니다.
+핵심 내용을 3문단 이내로 요약하세요.
 
 내용:
-{combined[:12000]}
+{chapter_text[:12000]}
 """
-                result = llm.invoke(prompt)
-                summaries.append({
-                    "chapter": ", ".join(matched_keys),
-                    "summaryText": result.content.strip()
-                })
-        else:
-            # 전체 단원 요약 요청 시
-            chapters_list = sorted(chapters.keys())
-            for k in chapters_list:
-                text = chapters[k][:12000]
-                prompt = f"""
-다음 PDF 내용을 바탕으로 단원 요약을 작성하세요.
-- 최대 3문단 내외
-- 핵심 위주
-- 내용에 기반한 중요한 키워드 포함
+    result = llm.invoke(prompt)
 
-내용:
-{text}
-"""
-                result = llm.invoke(prompt)
-                summaries.append({
-                    "chapter": k,
-                    "summaryText": result.content.strip()
-                })
-
-        return {"summaries": summaries}
-
-    except Exception as e:
-        logger.error(f"단원별 요약 실패: {str(e)}")
-        raise HTTPException(status_code=500, detail=str(e))
-
+    return {
+        "summaries": [
+            {
+                "chapter": request.chapter_request,
+                "summaryText": result.content.strip()
+            }
+        ]
+    }
 # -----------------------
 # LangChain Agent 기반 질문 엔드포인트
 # -----------------------
