@@ -56,6 +56,6 @@ jobs:
 
       - name: Done
         run: |
-          echo "Successfully pushed:"
+          echo "Successfully pushed!:"
           echo " - ${{ secrets.DOCKER_USERNAME }}/${{ env.DOCKER_IMAGE }}:${{ steps.bump.outputs.tag }}"
           echo " - ${{ secrets.DOCKER_USERNAME }}/${{ env.DOCKER_IMAGE }}:latest"
