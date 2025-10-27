@@ -38,8 +38,8 @@ tavily_tool = TavilySearch(api_key=TAVILY_API_KEY, max_results=3) if TAVILY_API_
 logging.basicConfig(level=logging.INFO, format='%(levelname)s: %(message)s')
 logger = logging.getLogger(__name__)
 
-UPLOAD_DIR = "/app/vector_stores"
-VECTOR_DIR = "/app/uploaded_pdfs"
+UPLOAD_DIR = "/app/uploaded_pdfs"
+VECTOR_DIR = "/app/vector_stores"
 os.makedirs(UPLOAD_DIR, exist_ok=True)
 os.makedirs(VECTOR_DIR, exist_ok=True)
 
