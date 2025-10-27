@@ -31,12 +31,13 @@ COPY --from=builder /usr/local/bin/uvicorn /usr/local/bin/uvicorn
 # 코드 복사
 COPY . .
 
-# 폴더 권한 및 기본 디렉토리 생성
 RUN useradd --create-home --shell /bin/bash appuser \
     && mkdir -p /app/uploaded_pdfs /app/vector_stores \
-    && chown -R appuser:appuser /app
+    && chown -R appuser:appuser /app/uploaded_pdfs /app/vector_stores
 
+# ✅ 이후부터 appuser로 실행
 USER appuser
+
 ENV PYTHONUNBUFFERED=1
 EXPOSE 8000
 
