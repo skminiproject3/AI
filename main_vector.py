@@ -4,8 +4,7 @@ import hashlib
 import json
 import logging
 from typing import List, Tuple, Optional, Dict, Any
-#from aiohttp import request
-from fastapi import FastAPI, UploadFile, File, HTTPException #, Form,Body
+from fastapi import FastAPI, UploadFile, File, HTTPException, Form
 from fastapi.responses import JSONResponse
 from pydantic import BaseModel, Field
 from dotenv import load_dotenv
@@ -16,6 +15,9 @@ from langchain.prompts import PromptTemplate
 from langchain.chains import RetrievalQA
 from langchain_tavily import TavilySearch
 import pymysql
+
+from fastapi import FastAPI
+from fastapi.middleware.cors import CORSMiddleware
 # ==========================================================
 # 환경 설정 및 초기화
 # ==========================================================
@@ -35,6 +37,22 @@ llm = ChatOpenAI(model="gpt-4o-mini", temperature=0.2, api_key=OPENAI_API_KEY)
 embeddings = OpenAIEmbeddings(api_key=OPENAI_API_KEY)
 tavily_tool = TavilySearch(api_key=TAVILY_API_KEY, max_results=3) if TAVILY_API_KEY else None
 
+app = FastAPI(title="PDF 학습 도우미 API")
+
+origins = [
+    "http://localhost:5173",
+    "http://127.0.0.1:5173",
+]
+
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=origins,          # 개발 중이면 ["*"]도 가능(credential 안 쓸 때)
+    allow_credentials=True,         # 쿠키/인증정보 쓰면 True
+    allow_methods=["*"],            # 최소한 ["POST","GET","OPTIONS"]여도 됨
+    allow_headers=["*"],            # 또는 ["content-type","authorization"]
+    expose_headers=["*"],           # (선택) 클라에서 읽을 헤더
+)
+
 logging.basicConfig(level=logging.INFO, format='%(levelname)s: %(message)s')
 logger = logging.getLogger(__name__)
 
@@ -51,14 +69,7 @@ class PdfPathsRequest(BaseModel):
 
 class ChapterRequest(BaseModel):
     pdf_paths: Optional[List[str]] = None
-    chapter: int
-    #chapter_request: Optional[str] = Field(None, alias="chapterRequest")
-class ChapterSummary(BaseModel):
-    chapter: str
-    summaryText: str
-
-class SummariesResponse(BaseModel):
-    summaries: List[ChapterSummary]
+    chapter_request: Optional[str] = None
 class QuestionRequest(BaseModel):
     question: str
     force_web: bool
@@ -68,8 +79,6 @@ class QuizGenerationRequest(BaseModel):
     pdf_paths: List[str]
     num_questions: int = Field(5, ge=1, le=20)
     difficulty: str = Field("MEDIUM", pattern="^(EASY|MEDIUM|HARD)$")
-
-
 def extract_text_from_pdf(pdf_path: str) -> str:
     try:
         loader = PyPDFLoader(pdf_path)
@@ -78,94 +87,23 @@ def extract_text_from_pdf(pdf_path: str) -> str:
     except Exception as e:
         logger.error(f"PDF 텍스트 추출 실패: {pdf_path} | {e}")
         return ""
-    
-# ==========================================================
-# ✅ 3️⃣ 벡터 DB에서 챕터별 내용 추출
-# ==========================================================
-def load_chapter_text_from_vector(vector_path: str, target_chapter: str) -> str:
-    vs = FAISS.load_local(vector_path, embeddings, allow_dangerous_deserialization=True)
-    
-    combined_text = ""
-    for doc in vs.docstore._dict.values():
-        combined_text += getattr(doc, "page_content", "") + "\n"
-
-    # metadata.json 순서 기반으로 다음 단원 위치 찾기
-    metadata_path = os.path.join(vector_path, "metadata.json")
-    with open(metadata_path, "r", encoding="utf-8") as f:
-        metadata = json.load(f)
-    chapters = sorted(metadata.get("chapters", []), key=lambda x: [int(n) for n in x["chapter"].split(".")])
-        # 타겟 챕터 메타데이터 찾기
-    target_meta = next((ch for ch in chapters if ch.get("chapter") == target_chapter), None)
-    
-    if not target_meta:
-        raise HTTPException(status_code=404, detail=f"metadata.json에 {target_chapter} 없음")
-    target_title = target_meta.get("title", "").strip()
-    WINDOW = 10  # 앞뒤 20글자 내에서 title 확인
-
-    # --- 시작 위치 탐색 (이중 조건: 번호 + title proximity)
-    start_idx = -1
-    for m in re.finditer(re.escape(target_chapter), combined_text):
-        idx = m.start()
-        # 주변 20글자 내 확인
-        context_start = max(0, idx - WINDOW)
-        context_end = min(len(combined_text), idx + WINDOW)
-        context = combined_text[context_start:context_end]
-        if target_title and target_title in context:
-            start_idx = idx
-            break
-
-    if start_idx == -1:
-        raise HTTPException(status_code=404, detail=f"{target_chapter} 시작 위치를 찾을 수 없음 (번호와 제목이 근접하지 않음)")
-
-    # 다음 단원 시작 위치
-    next_idx = len(combined_text)
-    for ch in chapters:
-        if ch["chapter"] > target_chapter:
-            idx = combined_text.find(ch["chapter"])
-            if idx != -1:
-                next_idx = idx
-                break
-    print(f"단원 텍스트 추출: {target_chapter} | start={start_idx} | end={next_idx}")
-    
-    return combined_text[start_idx:next_idx]
-
-
-# ==========================================================
-# ✅ 4️⃣ LLM을 이용해 요약 수행
-# ==========================================================
-def summarize_text_with_llm(chapter_label: str, text: str) -> str:
-    """
-    LangChain + OpenAI 모델을 사용해 텍스트 요약
-    """
-    prompt = f"다음 내용을 간결하게 요약해줘:\n\n{text[:12000]}"
-    result = llm.invoke(prompt)
-    return result.content.strip()
 
 def get_or_create_vectorstore(pdf_path: str) -> Optional[FAISS]:
-    normalized_path = pdf_path.replace("\\","/")
+    normalized_path = pdf_path.replace("\\", "/")
     path_hash = hashlib.md5(normalized_path.encode()).hexdigest()
     vector_path = os.path.join(VECTOR_DIR, path_hash)
-    metadata_path = os.path.join(vector_path, "metadata.json")
-
-    if os.path.exists(vector_path) and os.path.exists(metadata_path):
-        logger.info(f"📂 기존 벡터스토어 및 metadata.json 로드: {pdf_path}")
+    if os.path.exists(vector_path):
         return FAISS.load_local(vector_path, embeddings, allow_dangerous_deserialization=True)
-
-    # PDF 텍스트 추출
-    texts = extract_text_from_pdf(pdf_path)
-    chapters = recognize_chapters_with_llm(texts)
-
-    # 벡터스토어 생성
-    vs = FAISS.from_texts([texts], embeddings)
-    os.makedirs(vector_path, exist_ok=True)
-    vs.save_local(vector_path)
-
-    # metadata.json 저장
-    with open(metadata_path, "w", encoding="utf-8") as f:
-        json.dump({"chapters": chapters}, f, ensure_ascii=False, indent=2)
-    logger.info(f"✅ 벡터스토어 + metadata.json 생성 완료: {pdf_path}")
-
-    return vs
+    try:
+        loader = PyPDFLoader(pdf_path)
+        texts = [p.page_content for p in loader.load()]
+        vs = FAISS.from_texts(texts, embeddings)
+        vs.save_local(vector_path)
+        logger.info(f"✅ 벡터스토어 생성 완료: {pdf_path}")
+        return vs
+    except Exception as e:
+        logger.error(f"❌ 벡터 생성 실패 ({pdf_path}): {e}")
+        return None
 
 def combine_vectorstores(pdf_paths: List[str]) -> Tuple[Optional[FAISS], Optional[str]]:
     vectorstores = []
@@ -183,71 +121,25 @@ def combine_vectorstores(pdf_paths: List[str]) -> Tuple[Optional[FAISS], Optiona
     for i in range(1, len(vectorstores)):
         main_vs.merge_from(vectorstores[i])
     return main_vs, combined_content.strip()
-# -----------------------
-# 챕터 인식
-# -----------------------
-def recognize_chapters_with_llm(full_text: str):
-    """
-    첫 등장 숫자 기반 장 인식 후 LLM으로 검증
-    """
-    chapters = []
-    first_match = re.search(r"^(\d+)\s", full_text, re.MULTILINE)
-    if first_match:
-        chapters.append({"chapter": first_match.group(1), "title": ""})
-
-    # LLM으로 보정
-    try:
-        prompt = f"""
-아래는 PDF 텍스트입니다.
-텍스트에서 '장 번호'와 '장 제목'을 JSON 형태로 반환하세요.
-예: {{ "chapters": [{{"chapter": "1", "title": "암호 개론"}}] }}
-
-텍스트:
-{full_text[:10000]}
-"""
-        resp = llm.invoke(prompt)
-        json_text = resp.content.strip().replace("```json","").replace("```","")
-        llm_chapters = json.loads(json_text).get("chapters", [])
-        if llm_chapters:
-            chapters = llm_chapters
-    except Exception as e:
-        logger.warning(f"LLM 챕터 인식 실패: {e}")
-
-    return chapters
 
 # ==========================================================
 # 챕터 감지 로직
 # ==========================================================
 def detect_chapters_by_regex(text: str) -> List[str]:
-    """
-    PDF 텍스트에서 챕터 번호를 추출
-    - 번호 형식: 1.1, 2.3.4, 제1장, CHAPTER 1 등
-    - 중복 제거 후 정렬
-    """
-    try:
-        chapters = set()
-        # 1) 차례처럼 보이는 번호 우선 추출
-        toc_matches = re.findall(r"\b\d+(?:\.\d+)+\b", text)
-        if toc_matches:
-            return sorted(toc_matches, key=lambda x: [int(n) for n in x.split('.')])
-        
-        # 2) 각 줄 스캔
-        pattern = re.compile(r"(\b\d+(?:\.\d+)+\b|제\d+장|CHAPTER\s+\d+)", re.IGNORECASE)
-        for line in text.splitlines():
-            line = line.strip()
-            match = pattern.search(line)
-            if match:
-                chapters.add(match.group(1))
-        
-        # 정렬: 숫자 기반 우선, 문자 포함 챕터는 뒤로
-        def sort_key(ch):
-            nums = re.findall(r"\d+", ch)
-            return [int(n) for n in nums] if nums else [float('inf')]
-        
-        return sorted(chapters, key=sort_key)
-    except Exception as e:
-        logger.error(f"챕터 감지 실패 | {e}")
-        return []
+    patterns = [
+        r"제\s*\d+\s*장",
+        r"CHAPTER\s+\d+",
+        r"Chapter\s+\d+",
+        r"\b\d+\.\d+",
+        r"Section\s+\d+",
+        r"Part\s+[IVXLC\d]+"
+    ]
+    found = set()
+    for p in patterns:
+        matches = re.findall(p, text)
+        for m in matches:
+            found.add(m.strip())
+    return sorted(found)
 
 def detect_chapters_by_llm(text: str) -> List[str]:
     prompt = f"""
@@ -300,38 +192,7 @@ def get_pdf_paths_for_content(content_id: int):
         if connection:
             connection.close()
     return paths
-def get_vector_paths_for_content(content_id: int) -> List[str]:
-    """
-    content_id 기준으로 MariaDB에서 vector_path를 조회
-    반환: 벡터스토어 경로 리스트
-    """
-    connection = None
-    paths = []
 
-    try:
-        connection = pymysql.connect(
-            host=DB_HOST,
-            port=DB_PORT,
-            user=DB_USER,
-            password=DB_PASSWORD,
-            database=DB_DATABASE,
-            charset='utf8mb4',
-            cursorclass=pymysql.cursors.DictCursor
-        )
-
-        with connection.cursor() as cursor:
-            sql = "SELECT vector_path FROM contents WHERE id=%s"
-            cursor.execute(sql, (content_id,))
-            result = cursor.fetchall()
-            paths = [row['vector_path'] for row in result if row['vector_path']]
-
-    except Exception as e:
-        print(f"❌ 벡터 경로 조회 실패: {e}")
-    finally:
-        if connection:
-            connection.close()
-
-    return paths
 # ==========================================================
 # FastAPI 초기화
 # ==========================================================
@@ -436,70 +297,57 @@ async def summarize_full(content_id: int):
 # ✅ /summaries (단원별 요약)
 # ==========================================================
 @app.post("/api/contents/{content_id}/summaries")
-def summarize_by_chapter(content_id: int, request: ChapterRequest):
-    
-    if not request.chapter:
-        raise HTTPException(status_code=400, detail="chapter 필수")
+async def summarize_chapter(content_id: int, request: Optional[ChapterRequest] = None):
+    """
+    pdf_paths를 안 보낸 경우, DB에서 자동으로 해당 content_id의 PDF 경로 조회
+    """
+    # pdf_paths 유효성 확인
+    pdf_paths = []
+    if request and request.pdf_paths:
+        pdf_paths = request.pdf_paths
+    else:
+        pdf_paths = get_pdf_paths_for_content(content_id)  # ✅ DB에서 가져오기
 
-    # 1️⃣ content_id 기준 벡터스토어 경로 조회
-    vector_paths = get_vector_paths_for_content(content_id)
-    if not vector_paths:
-        raise HTTPException(status_code=404, detail="Vector path not found")
+    if not pdf_paths:
+        raise HTTPException(status_code=404, detail="PDF 경로를 찾을 수 없습니다.")
 
-    vector_path = vector_paths[0]
-    
-    # 2️⃣ metadata.json 로드
-    metadata_path = os.path.join(vector_path, "metadata.json")
-    if not os.path.exists(metadata_path):
-        raise HTTPException(status_code=404, detail="metadata.json 없음")
+    # chapter_request 읽기 (없으면 전체 요약)
+    chapter_req = None
+    if request and request.chapter_request:
+        chapter_req = request.chapter_request
 
-    with open(metadata_path, "r", encoding="utf-8") as f:
-        metadata = json.load(f)
-        
-    chapters = metadata.get("chapters", [])
-    if not chapters:
-        raise HTTPException(status_code=404, detail="metadata.json에 단원이 없음")
-    
-    # 3️⃣ 마지막 숫자 기준 chapter 찾기
-    target_chapter_obj = None
-    for ch in chapters:
-        parts = ch["chapter"].split(".")
-        if parts[-1] == str(request.chapter):
-            target_chapter_obj = ch
-            
-            break
+    # PDF 내용 병합
+    _, combined_content = combine_vectorstores(pdf_paths)
+    if not combined_content:
+        raise HTTPException(status_code=400, detail="PDF 내용 로드 실패")
 
-    if not target_chapter_obj:
-            return {
-                "summaries": [
-                    {
-                        "chapter": str(request.chapter),
-                        "title": "",
-                        "summaryText": f" 요청 하신 chapter는 존재하지 않습니다."
-                    }
-                ]
-            }
-    
-    target_chapter = target_chapter_obj["chapter"]
-    chapter_title = target_chapter_obj.get("title", "")
-    
-    # 4️⃣ 벡터스토어에서 해당 chapter 텍스트 추출
-    chapter_text = load_chapter_text_from_vector(vector_path, target_chapter)
+    # 챕터별 요약 생성 (이전 로직 동일)
+    pattern = r"^(\d+\.\d+(\.\d+)?)\s*(.*)$"
+    chapters = {}
+    current_chapter = None
+    for line in combined_content.splitlines():
+        line = line.strip()
+        if not line:
+            continue
+        match = re.match(pattern, line)
+        if match:
+            current_chapter = match.group(1)
+            chapters[current_chapter] = match.group(3) + "\n"
+        elif current_chapter:
+            chapters[current_chapter] += line + "\n"
 
-    # 5️⃣ LLM으로 요약
-    summary_text = summarize_text_with_llm(target_chapter, chapter_text)
+    summaries = []
+    if chapter_req:
+        matched = [k for k in chapters.keys() if k.startswith(chapter_req)]
+        combined = "\n".join([chapters[k] for k in matched])
+        result = llm.invoke(f"다음 내용을 요약해줘:\n{combined[:8000]}")
+        summaries.append({"chapter": chapter_req, "summaryText": result.content.strip()})
+    else:
+        for k, v in chapters.items():
+            result = llm.invoke(f"{k} 내용을 요약해줘:\n{v[:8000]}")
+            summaries.append({"chapter": k, "summaryText": result.content.strip()})
 
-    # 6️⃣ 결과 반환
-    return {
-        "summaries": [
-            {
-                "chapter": target_chapter,
-                "title": chapter_title,
-                "summaryText": summary_text
-            }
-        ]
-    }
-
+    return {"summaries": summaries}
 
 # -----------------------
 # LangChain Agent 기반 질문 엔드포인트
