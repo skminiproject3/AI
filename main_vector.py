@@ -159,6 +159,7 @@ def get_or_create_vectorstore(pdf_path: str) -> Optional[FAISS]:
     vs = FAISS.from_texts([texts], embeddings)
     os.makedirs(vector_path, exist_ok=True)
     vs.save_local(vector_path)
+    print('vs',vs)
 
 
     # metadata.json 저장
