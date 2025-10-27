@@ -160,6 +160,7 @@ def get_or_create_vectorstore(pdf_path: str) -> Optional[FAISS]:
     os.makedirs(vector_path, exist_ok=True)
     vs.save_local(vector_path)
 
+
     # metadata.json 저장
     with open(metadata_path, "w", encoding="utf-8") as f:
         json.dump({"chapters": chapters}, f, ensure_ascii=False, indent=2)
@@ -171,12 +172,15 @@ def combine_vectorstores(pdf_paths: List[str]) -> Tuple[Optional[FAISS], Optiona
     vectorstores = []
     combined_content = ""
     for pdf_path in pdf_paths:
+        print("path",pdf_path)
         if not os.path.exists(pdf_path):
             continue
         vs = get_or_create_vectorstore(pdf_path)
+        print("vs",vs)
         if vs:
             vectorstores.append(vs)
             combined_content += extract_text_from_pdf(pdf_path) + "\n\n--- PDF 분리 ---\n\n"
+            print('combined_content',combined_content)
     if not vectorstores:
         return None, None
     main_vs = vectorstores[0]
@@ -280,12 +284,21 @@ def get_pdf_paths_for_content(content_id: int):
     connection = None
     paths = []
     try:
+        # connection = pymysql.connect(
+        #     host=DB_HOST,
+        #     port=DB_PORT,
+        #     user=DB_USER,
+        #     password=DB_PASSWORD,
+        #     database=DB_DATABASE,
+        #     charset='utf8mb4',
+        #     cursorclass=pymysql.cursors.DictCursor
+        # )
         connection = pymysql.connect(
-            host=DB_HOST,
-            port=DB_PORT,
-            user=DB_USER,
-            password=DB_PASSWORD,
-            database=DB_DATABASE,
+            host='mysql-svc',
+            port=3306,
+            user='boot',
+            password='boot',
+            database='study_db',
             charset='utf8mb4',
             cursorclass=pymysql.cursors.DictCursor
         )
@@ -294,6 +307,23 @@ def get_pdf_paths_for_content(content_id: int):
             cursor.execute(sql, (content_id,))
             result = cursor.fetchall()
             paths = [row['file_path'] for row in result if row['file_path']]
+            print('paths===',paths)
+
+        # ✅ 경로 자동 보정
+        fixed_paths = []
+        for p in paths:
+            if p.startswith("/uploads/"):
+                # DB에 /uploads/로 저장된 경우 → FastAPI 내부 실제 경로로 변환
+                fixed_paths.append(p.replace("/uploads/", "/app/uploaded_pdfs/"))
+            elif not p.startswith("/app/"):
+                # 윈도우 경로나 상대경로 → 파일명만 추출해서 uploaded_pdfs로 맞춤
+                fixed_paths.append(os.path.join("/app/uploaded_pdfs", os.path.basename(p)))
+            else:
+                fixed_paths.append(p)
+
+        paths = fixed_paths
+        print("🧩 fixed_paths===", paths)
+
     except Exception as e:
         logger.error(f"❌ DB 조회 실패: {e}")
     finally:
@@ -421,6 +451,7 @@ async def summarize_full(content_id: int):
     if not pdf_paths:
         raise HTTPException(status_code=404, detail="PDF 경로 없음")
     _, combined_content = combine_vectorstores(pdf_paths)
+    print('combined_content',combined_content)
     if not combined_content:
         raise HTTPException(status_code=400, detail="PDF 내용 로드 실패")
     prompt = f"""
